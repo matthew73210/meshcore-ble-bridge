@@ -41,6 +41,7 @@ class MeshCoreBLEBridge : public Component, public ble_client::BLEClientNode {
   static constexpr size_t MAX_TCP_TX_BUFFER = 4096;
   static constexpr uint16_t DEFAULT_ATT_MTU = 23;
   static constexpr uint16_t REQUESTED_ATT_MTU = 517;
+  static constexpr uint16_t SET_MTU_RETRY= 3;
 
   bool start_server_();
   void accept_client_();
@@ -80,6 +81,7 @@ class MeshCoreBLEBridge : public Component, public ble_client::BLEClientNode {
 
   bool auth_complete_{false};
   bool mtu_configured_{false};
+  int16_t mtu_retry_{0};
   bool ble_ready_{false};
   bool ble_write_in_flight_{false};
   bool notify_register_requested_{false};
@@ -88,6 +90,8 @@ class MeshCoreBLEBridge : public Component, public ble_client::BLEClientNode {
   uint16_t rx_handle_{0};
   uint16_t tx_handle_{0};
   uint16_t tx_cccd_handle_{0};
+ private:
+  void set_mtu(esp_ble_gattc_cb_param_t *param, esp_gatt_if_t gattc_if);
 };
 
 }  // namespace esphome::meshcore_ble_bridge

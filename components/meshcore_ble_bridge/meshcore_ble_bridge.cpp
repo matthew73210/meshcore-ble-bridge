@@ -53,6 +53,27 @@ void MeshCoreBLEBridge::loop() {
   this->read_tcp_();
 }
 
+void esphome::meshcore_ble_bridge::MeshCoreBLEBridge::set_mtu(
+    esp_ble_gattc_cb_param_t *param, esp_gatt_if_t gattc_if) {
+    this->mtu_retry_++;
+    ESP_LOGD(TAG, "Send MTU request %d. Probe %d", REQUESTED_ATT_MTU,
+             this->mtu_retry_);
+
+    esp_ble_gatt_set_local_mtu(REQUESTED_ATT_MTU);
+    if (param->connect.conn_id == this->parent()->get_conn_id()) {
+        auto mtu_err = esp_ble_gattc_send_mtu_req(gattc_if, param->connect.conn_id);
+        if (mtu_err != ESP_OK) {
+            this->mtu_configured_ = true;
+            this->negotiated_mtu_ = DEFAULT_ATT_MTU;
+            ESP_LOGW(TAG,
+                     "BLE MTU request failed to start, err=%d; continuing with %u "
+                     "byte payload limit",
+                     mtu_err, static_cast<unsigned>(this->ble_payload_limit_()));
+            this->maybe_enable_notifications_();
+        }
+    }
+}
+
 void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                                             esp_ble_gattc_cb_param_t *param) {
   switch (event) {
@@ -60,17 +81,8 @@ void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt
       this->reset_ble_state_();
       this->negotiated_mtu_ = DEFAULT_ATT_MTU;
       this->mtu_configured_ = false;
-      esp_ble_gatt_set_local_mtu(REQUESTED_ATT_MTU);
-      if (param->connect.conn_id == this->parent()->get_conn_id()) {
-        auto mtu_err = esp_ble_gattc_send_mtu_req(gattc_if, param->connect.conn_id);
-        if (mtu_err != ESP_OK) {
-          this->mtu_configured_ = true;
-          this->negotiated_mtu_ = DEFAULT_ATT_MTU;
-          ESP_LOGW(TAG, "BLE MTU request failed to start, err=%d; continuing with %u byte payload limit",
-                   mtu_err, static_cast<unsigned>(this->ble_payload_limit_()));
-          this->maybe_enable_notifications_();
-        }
-      }
+      this->mtu_retry_ = 0;
+      set_mtu(param, gattc_if);
       if (this->force_encryption_) {
         ESP_LOGD(TAG, "Requesting authenticated BLE encryption");
         esp_ble_set_encryption(this->parent()->get_remote_bda(), ESP_BLE_SEC_ENCRYPT_MITM);
@@ -80,8 +92,8 @@ void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt
     case ESP_GATTC_CFG_MTU_EVT:
       if (param->cfg_mtu.conn_id != this->parent()->get_conn_id())
         break;
-      this->mtu_configured_ = true;
       if (param->cfg_mtu.status == ESP_GATT_OK) {
+        this->mtu_configured_ = true;
         this->negotiated_mtu_ = param->cfg_mtu.mtu;
         ESP_LOGI(TAG, "BLE MTU negotiated: %u bytes (%u byte payload)", this->negotiated_mtu_,
                  static_cast<unsigned>(this->ble_payload_limit_()));
@@ -90,9 +102,14 @@ void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt
                    static_cast<unsigned>(this->ble_payload_limit_()), static_cast<unsigned>(MAX_MESHCORE_PAYLOAD));
         }
       } else {
-        this->negotiated_mtu_ = DEFAULT_ATT_MTU;
-        ESP_LOGE(TAG, "BLE MTU negotiation failed, status=%d; only %u byte payloads are safe",
+        if (this->mtu_retry_ < SET_MTU_RETRY) {
+          set_mtu(param, gattc_if);
+        } else {
+          this->mtu_configured_ = true;
+          this->negotiated_mtu_ = DEFAULT_ATT_MTU;
+          ESP_LOGE(TAG, "BLE MTU negotiation failed, status=%d; only %u byte payloads are safe",
                  param->cfg_mtu.status, static_cast<unsigned>(this->ble_payload_limit_()));
+        }
       }
       this->maybe_enable_notifications_();
       break;
