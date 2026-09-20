@@ -1,3 +1,5 @@
+# Looking for someone to take over this repo as i'm unable to maintain it (no ble bridge devices)
+
 # MeshCore BLE Bridge for ESPHome
 
 This external ESPHome component keeps the BLE connection on the ESP32, where
