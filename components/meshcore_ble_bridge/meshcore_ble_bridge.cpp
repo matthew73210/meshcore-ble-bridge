@@ -23,9 +23,6 @@ void MeshCoreBLEBridge::setup() {
   this->setup_complete_ = true;
   this->tcp_rx_buffer_.reserve(MAX_TCP_BUFFER);
   this->tcp_tx_buffer_.reserve(MAX_TCP_TX_BUFFER);
-  auto mtu_err = esp_ble_gatt_set_local_mtu(REQUESTED_ATT_MTU);
-  if (mtu_err != ESP_OK)
-    ESP_LOGW(TAG, "Unable to set local BLE MTU to %u, err=%d", REQUESTED_ATT_MTU, mtu_err);
   if (!this->start_server_()) {
     ESP_LOGE(TAG, "TCP bridge failed to start on port %u", this->port_);
   }
@@ -39,7 +36,6 @@ void MeshCoreBLEBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "  Force encrypted BLE link: %s", YESNO(this->force_encryption_));
   ESP_LOGCONFIG(TAG, "  Wait for BLE auth: %s", YESNO(this->wait_for_auth_));
   ESP_LOGCONFIG(TAG, "  Write with response: %s", YESNO(this->write_with_response_));
-  ESP_LOGCONFIG(TAG, "  Requested BLE MTU: %u", REQUESTED_ATT_MTU);
   ESP_LOGCONFIG(TAG, "  Negotiated BLE MTU: %u", this->negotiated_mtu_);
 }
 
@@ -53,36 +49,13 @@ void MeshCoreBLEBridge::loop() {
   this->read_tcp_();
 }
 
-void esphome::meshcore_ble_bridge::MeshCoreBLEBridge::set_mtu(
-    esp_ble_gattc_cb_param_t *param, esp_gatt_if_t gattc_if) {
-    this->mtu_retry_++;
-    ESP_LOGD(TAG, "Send MTU request %d. Probe %d", REQUESTED_ATT_MTU,
-             this->mtu_retry_);
-
-    esp_ble_gatt_set_local_mtu(REQUESTED_ATT_MTU);
-    if (param->connect.conn_id == this->parent()->get_conn_id()) {
-        auto mtu_err = esp_ble_gattc_send_mtu_req(gattc_if, param->connect.conn_id);
-        if (mtu_err != ESP_OK) {
-            this->mtu_configured_ = true;
-            this->negotiated_mtu_ = DEFAULT_ATT_MTU;
-            ESP_LOGW(TAG,
-                     "BLE MTU request failed to start, err=%d; continuing with %u "
-                     "byte payload limit",
-                     mtu_err, static_cast<unsigned>(this->ble_payload_limit_()));
-            this->maybe_enable_notifications_();
-        }
-    }
-}
-
 void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                                             esp_ble_gattc_cb_param_t *param) {
   switch (event) {
     case ESP_GATTC_CONNECT_EVT:
       this->reset_ble_state_();
-      this->negotiated_mtu_ = DEFAULT_ATT_MTU;
-      this->mtu_configured_ = false;
-      this->mtu_retry_ = 0;
-      set_mtu(param, gattc_if);
+      // No MTU request here: ESPHome's BLEClientBase already sends one in this very event, and ATT
+      // allows a single MTU exchange per connection. We only observe its result in CFG_MTU_EVT.
       if (this->force_encryption_) {
         ESP_LOGD(TAG, "Requesting authenticated BLE encryption");
         esp_ble_set_encryption(this->parent()->get_remote_bda(), ESP_BLE_SEC_ENCRYPT_MITM);
@@ -93,25 +66,13 @@ void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt
       if (param->cfg_mtu.conn_id != this->parent()->get_conn_id())
         break;
       if (param->cfg_mtu.status == ESP_GATT_OK) {
-        this->mtu_configured_ = true;
         this->negotiated_mtu_ = param->cfg_mtu.mtu;
-        ESP_LOGI(TAG, "BLE MTU negotiated: %u bytes (%u byte payload)", this->negotiated_mtu_,
+        ESP_LOGI(TAG, "BLE MTU: %u (max single-write frame %u bytes)", this->negotiated_mtu_,
                  static_cast<unsigned>(this->ble_payload_limit_()));
-        if (this->ble_payload_limit_() < MAX_MESHCORE_PAYLOAD) {
-          ESP_LOGW(TAG, "BLE MTU payload %u is below MeshCore max payload %u; large messages may be rejected",
-                   static_cast<unsigned>(this->ble_payload_limit_()), static_cast<unsigned>(MAX_MESHCORE_PAYLOAD));
-        }
       } else {
-        if (this->mtu_retry_ < SET_MTU_RETRY) {
-          set_mtu(param, gattc_if);
-        } else {
-          this->mtu_configured_ = true;
-          this->negotiated_mtu_ = DEFAULT_ATT_MTU;
-          ESP_LOGE(TAG, "BLE MTU negotiation failed, status=%d; only %u byte payloads are safe",
-                 param->cfg_mtu.status, static_cast<unsigned>(this->ble_payload_limit_()));
-        }
+        this->negotiated_mtu_ = DEFAULT_ATT_MTU;
+        ESP_LOGW(TAG, "BLE MTU exchange failed, status=%d; staying at %u", param->cfg_mtu.status, DEFAULT_ATT_MTU);
       }
-      this->maybe_enable_notifications_();
       break;
 
     case ESP_GATTC_DISCONNECT_EVT:
@@ -356,12 +317,23 @@ void MeshCoreBLEBridge::write_ble_(const uint8_t *data, size_t len) {
     return;
   }
 
-  const size_t payload_limit = this->ble_payload_limit_();
-  if (len > payload_limit) {
-    ESP_LOGE(TAG, "MeshCore frame length %u exceeds negotiated BLE payload %u; closing TCP client",
-             static_cast<unsigned>(len), static_cast<unsigned>(payload_limit));
-    this->close_client_();
-    return;
+  // MeshCore's BLE transport has no framing of its own: the node treats every GATT write to the
+  // NUS RX characteristic as one complete command frame (SerialBLEInterface::onWrite). A frame must
+  // therefore reach the node as exactly ONE write and must never be split into chunks - chunking
+  // makes the node execute the first chunk as a truncated command and the rest as garbage commands.
+  const size_t att_payload = this->ble_payload_limit_();
+  if (len > att_payload) {
+    if (!this->write_with_response_) {
+      // Write Command has no long-write variant, so this frame cannot be delivered atomically.
+      ESP_LOGE(TAG, "Frame cmd=0x%02X len=%u exceeds ATT payload %u and write_with_response is off; rejected",
+               data[0], static_cast<unsigned>(len), static_cast<unsigned>(att_payload));
+      this->send_error_to_tcp_(ERR_CODE_ILLEGAL_ARG);
+      return;
+    }
+    // Write Request: Bluedroid turns this into Prepare/Execute Write, and the node's GATT server
+    // reassembles it into a single write -> still exactly one MeshCore frame.
+    ESP_LOGD(TAG, "Frame len=%u > ATT payload %u, sending as long write", static_cast<unsigned>(len),
+             static_cast<unsigned>(att_payload));
   }
 
   this->ble_tx_queue_.emplace_back(data, data + len);
@@ -419,6 +391,13 @@ void MeshCoreBLEBridge::send_to_tcp_(const uint8_t *data, size_t len) {
   this->flush_tcp_tx_();
 }
 
+void MeshCoreBLEBridge::send_error_to_tcp_(uint8_t err_code) {
+  // Answer like the node would, so meshcore-py resolves the pending command with an ERROR event
+  // instead of timing out or losing the whole TCP session.
+  const uint8_t frame[2] = {RESP_CODE_ERR, err_code};
+  this->send_to_tcp_(frame, sizeof(frame));
+}
+
 bool MeshCoreBLEBridge::flush_tcp_tx_() {
   if (this->client_fd_ < 0)
     return true;
@@ -450,7 +429,6 @@ bool MeshCoreBLEBridge::flush_tcp_tx_() {
 
 void MeshCoreBLEBridge::reset_ble_state_() {
   this->auth_complete_ = false;
-  this->mtu_configured_ = false;
   this->ble_ready_ = false;
   this->notify_register_requested_ = false;
   this->ble_write_in_flight_ = false;
@@ -552,10 +530,6 @@ bool MeshCoreBLEBridge::discover_handles_() {
 void MeshCoreBLEBridge::maybe_enable_notifications_() {
   if (this->rx_handle_ == 0 || this->tx_handle_ == 0)
     return;
-  if (!this->mtu_configured_) {
-    ESP_LOGD(TAG, "Waiting for BLE MTU negotiation before enabling MeshCore notifications");
-    return;
-  }
   if (this->wait_for_auth_ && !this->auth_complete_) {
     if (!this->auth_wait_logged_) {
       ESP_LOGW(TAG, "BLE auth completion was not reported yet; enabling notifications with authenticated writes");
@@ -576,14 +550,11 @@ void MeshCoreBLEBridge::maybe_enable_notifications_() {
 }
 
 void MeshCoreBLEBridge::mark_ble_ready_() {
+  if (this->ble_ready_)
+    return;
   this->ble_ready_ = true;
   this->node_state = espbt::ClientState::ESTABLISHED;
-  ESP_LOGI(TAG, "MeshCore BLE bridge ready, MTU=%u payload=%u", this->negotiated_mtu_,
-           static_cast<unsigned>(this->ble_payload_limit_()));
-  if (this->ble_payload_limit_() < MAX_MESHCORE_PAYLOAD) {
-    ESP_LOGW(TAG, "BLE payload is below MeshCore TCP max payload %u; some Home Assistant entities may not update",
-             static_cast<unsigned>(MAX_MESHCORE_PAYLOAD));
-  }
+  ESP_LOGI(TAG, "MeshCore BLE bridge ready, MTU=%u", this->negotiated_mtu_);
 }
 
 size_t MeshCoreBLEBridge::ble_payload_limit_() const {
