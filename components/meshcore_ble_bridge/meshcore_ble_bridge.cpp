@@ -92,11 +92,17 @@ void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt
     case ESP_GATTC_CFG_MTU_EVT:
       if (param->cfg_mtu.conn_id != this->parent()->get_conn_id())
         break;
-      if (param->cfg_mtu.status == ESP_GATT_OK) {
+      if (param->cfg_mtu.status == ESP_GATT_OK || param->cfg_mtu.mtu > DEFAULT_ATT_MTU) {
         this->mtu_configured_ = true;
         this->negotiated_mtu_ = param->cfg_mtu.mtu;
-        ESP_LOGI(TAG, "BLE MTU negotiated: %u bytes (%u byte payload)", this->negotiated_mtu_,
-                 static_cast<unsigned>(this->ble_payload_limit_()));
+        if (param->cfg_mtu.status == ESP_GATT_OK) {
+          ESP_LOGI(TAG, "BLE MTU negotiated: %u bytes (%u byte payload)", this->negotiated_mtu_,
+                   static_cast<unsigned>(this->ble_payload_limit_()));
+        } else {
+          ESP_LOGW(TAG, "BLE MTU event failed with status=%d but reported mtu=%u; using reported payload %u",
+                   param->cfg_mtu.status, static_cast<unsigned>(this->negotiated_mtu_),
+                   static_cast<unsigned>(this->ble_payload_limit_()));
+        }
         if (this->ble_payload_limit_() < MAX_MESHCORE_PAYLOAD) {
           ESP_LOGW(TAG, "BLE MTU payload %u is below MeshCore max payload %u; large messages may be rejected",
                    static_cast<unsigned>(this->ble_payload_limit_()), static_cast<unsigned>(MAX_MESHCORE_PAYLOAD));
@@ -358,9 +364,8 @@ void MeshCoreBLEBridge::write_ble_(const uint8_t *data, size_t len) {
 
   const size_t payload_limit = this->ble_payload_limit_();
   if (len > payload_limit) {
-    ESP_LOGE(TAG, "MeshCore frame length %u exceeds negotiated BLE payload %u; closing TCP client",
+    ESP_LOGE(TAG, "MeshCore frame length %u exceeds negotiated BLE payload %u; dropping frame",
              static_cast<unsigned>(len), static_cast<unsigned>(payload_limit));
-    this->close_client_();
     return;
   }
 
